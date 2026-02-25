@@ -1,0 +1,10 @@
+.git
+.gitignore
+*.md
+docs/
+working_docs/
+loadtest/
+nest-ui/
+rules/
+CLAUDE.md
+.claude/

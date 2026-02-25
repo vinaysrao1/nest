@@ -1,0 +1,22 @@
+-- Nest v1.0 Rule Name Uniqueness
+-- Add UNIQUE constraint on (org_id, name) to the rules table,
+-- matching the pattern used by item_types, actions, and mrt_queues.
+--
+-- PREREQUISITE: Before running this migration on a database with existing
+-- duplicate rule names, run the data cleanup query below to remove duplicates
+-- (keeping the most recently created row for each name):
+--
+--   DELETE FROM rules
+--   WHERE id IN (
+--     SELECT id FROM (
+--       SELECT id, ROW_NUMBER() OVER (PARTITION BY org_id, name ORDER BY created_at DESC) AS rn
+--       FROM rules
+--     ) sub
+--     WHERE rn > 1
+--   );
+--
+-- If duplicates exist, the CREATE UNIQUE INDEX will fail with:
+--   ERROR: could not create unique index "rules_org_id_name_key"
+--   DETAIL: Key (org_id, name)=(...) is duplicated.
+
+ALTER TABLE rules ADD CONSTRAINT rules_org_id_name_key UNIQUE (org_id, name);

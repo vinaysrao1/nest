@@ -1,0 +1,78 @@
+# Claude Code
+.claude/
+CLAUDE.md
+
+# Custom analyzers / tooling
+tools/
+
+# Working docs (architect plans, bug tracker)
+working_docs/
+
+# Internal design docs (not for public repo)
+docs/NEST_DESIGN.md
+docs/NEST_MODULES.md
+docs/NEST_STAGING.md
+docs/NEST_UI.md
+docs/old/
+
+# Go binaries
+nest
+server
+migrate
+seed
+*.exe
+
+# Load test binaries
+loadtest/bin/
+loadtest/setup/setup
+loadtest/generator/generator
+loadtest/receiver/receiver
+loadtest/validate/validate
+
+# Go profiling output
+*.prof
+
+# Go build cache / test cache
+*.test
+*.out
+cover.out
+coverage.html
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+
+# NiceGUI storage
+.nicegui/
+
+# Pytest
+.pytest_cache/
+
+# Benchmarks
+.benchmarks/
+
+# Environment / secrets
+.env
+.env.*
+*.pem
+*.key
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Docker
+*.tar

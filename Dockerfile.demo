@@ -1,0 +1,95 @@
+# Dockerfile.demo — Single-container Nest demo image
+#
+# Includes PostgreSQL, Go backend, Jetstream consumer, and NiceGUI admin UI.
+#
+# Build:  docker build -f Dockerfile.demo -t nest-demo .
+# Run:    docker run -p 8080:8080 -p 8090:8090 nest-demo
+
+# ---------------------------------------------------------------------------
+# Stage 1: Go builder — compile all static binaries
+# ---------------------------------------------------------------------------
+FROM golang:1-alpine AS builder
+
+RUN apk --no-cache add git
+
+WORKDIR /app
+
+# Main module (nest server, migrate, seed)
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /bin/nest      ./cmd/server/
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /bin/migrate   ./cmd/migrate/
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /bin/seed      ./cmd/seed/
+
+# Setup binary (separate go.mod under loadtest/setup/)
+WORKDIR /app/loadtest/setup
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /bin/setup ./
+
+# Consumer binary (separate go.mod under jetstream/consumer/)
+WORKDIR /app/jetstream/consumer
+RUN go mod download
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /bin/consumer ./
+
+# ---------------------------------------------------------------------------
+# Stage 2: Runtime — Alpine with PostgreSQL + Python + all binaries
+# ---------------------------------------------------------------------------
+FROM alpine:3.20
+
+RUN apk --no-cache add \
+    postgresql16 \
+    postgresql16-contrib \
+    python3 \
+    py3-pip \
+    ca-certificates \
+    tzdata \
+    curl \
+    su-exec
+
+# Python dependencies (no venv needed in container)
+RUN pip3 install --break-system-packages nicegui httpx
+
+# Create nest user for Go/Python processes
+RUN addgroup -S nest && adduser -S nest -G nest
+
+WORKDIR /app
+
+# Copy Go binaries
+COPY --from=builder /bin/nest      /app/nest
+COPY --from=builder /bin/migrate   /app/migrate
+COPY --from=builder /bin/seed      /app/seed
+COPY --from=builder /bin/setup     /app/setup
+COPY --from=builder /bin/consumer  /app/consumer
+
+# Copy migrations
+COPY migrations/ /app/migrations/
+
+# Copy Starlark rules for setup to load
+COPY loadtest/rules/ /app/rules/
+
+# Copy Python UI source
+COPY nest-ui/ /app/nest-ui/
+
+# Copy entrypoint
+COPY entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
+
+# Create PostgreSQL data directory
+RUN mkdir -p /var/lib/postgresql/data && chown -R postgres:postgres /var/lib/postgresql
+
+# Create tmp dir writable by nest user (for API key / item type files)
+RUN mkdir -p /tmp && chmod 1777 /tmp
+
+EXPOSE 8080 8090
+
+ENV DATABASE_URL="postgres://nest:nest@localhost:5432/nest?sslmode=disable" \
+    SESSION_SECRET="demo-session-secret-change-in-production" \
+    PORT=8080 \
+    UI_PORT=8090 \
+    LOG_LEVEL=info
+
+HEALTHCHECK --interval=30s --timeout=5s \
+    CMD curl -sf http://localhost:8080/api/v1/health || exit 1
+
+ENTRYPOINT ["/app/entrypoint.sh"]

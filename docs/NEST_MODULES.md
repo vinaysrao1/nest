@@ -305,13 +305,14 @@ type EntityHistoryEntry struct {
 }
 
 type MRTQueue struct {
-    ID          string `json:"id"`
-    OrgID       string `json:"org_id"`
-    Name        string `json:"name"`
-    Description string `json:"description,omitempty"`
-    IsDefault   bool   `json:"is_default"`
-    CreatedAt   time.Time `json:"created_at"`
-    UpdatedAt   time.Time `json:"updated_at"`
+    ID          string     `json:"id"`
+    OrgID       string     `json:"org_id"`
+    Name        string     `json:"name"`
+    Description string     `json:"description,omitempty"`
+    IsDefault   bool       `json:"is_default"`
+    ArchivedAt  *time.Time `json:"archived_at,omitempty"`
+    CreatedAt   time.Time  `json:"created_at"`
+    UpdatedAt   time.Time  `json:"updated_at"`
 }
 
 type MRTJob struct {
@@ -544,9 +545,13 @@ func (q *Queries) DeleteItemType(ctx context.Context, orgID, itemTypeID string) 
 func (q *Queries) InsertItem(ctx context.Context, orgID string, item domain.Item) error
 
 // --- MRT ---
+// Note: ListMRTQueues and GetMRTQueueByName filter WHERE archived_at IS NULL.
+// GetMRTQueue (by ID) does NOT filter archived -- archived queues remain accessible for job drain.
 func (q *Queries) ListMRTQueues(ctx context.Context, orgID string) ([]domain.MRTQueue, error)
 func (q *Queries) GetMRTQueue(ctx context.Context, orgID, queueID string) (*domain.MRTQueue, error)
+func (q *Queries) GetMRTQueueByName(ctx context.Context, orgID, name string) (*domain.MRTQueue, error)
 func (q *Queries) CreateMRTQueue(ctx context.Context, queue *domain.MRTQueue) error
+func (q *Queries) ArchiveMRTQueue(ctx context.Context, orgID, queueID string) error
 func (q *Queries) ListMRTJobs(ctx context.Context, orgID, queueID string, status *string, page domain.PageParams) (*domain.PaginatedResult[domain.MRTJob], error)
 func (q *Queries) GetMRTJob(ctx context.Context, orgID, jobID string) (*domain.MRTJob, error)
 func (q *Queries) InsertMRTJob(ctx context.Context, job *domain.MRTJob) error
@@ -638,7 +643,7 @@ func (q *Queries) GetActionItemTypes(ctx context.Context, actionID string) ([]st
 - Entity history stores JSONB snapshots via a single generic table.
 - `GetUserByEmail` does NOT take orgID because during login the org is unknown. It returns the User (which includes OrgID), and the auth layer uses that to establish the org context. If multiple orgs share the same email domain, the users table UNIQUE constraint on (org_id, email) ensures uniqueness per org; the login flow uses the single matching user or returns an error if ambiguous.
 - Text bank entry operations (`AddTextBankEntry`, `DeleteTextBankEntry`, `GetTextBankEntries`) include orgID to enforce multi-tenant isolation. The store joins through text_banks to verify org ownership.
-- MRT queue creation (`CreateMRTQueue`) is used by `cmd/seed` for development setup and by the service layer if queue CRUD is exposed in future versions. In v1.0, queues are created during org provisioning.
+- MRT queue creation (`CreateMRTQueue`) is used by `cmd/seed` for development setup and by `MRTService.CreateQueue`. `ArchiveMRTQueue` soft-deletes by setting `archived_at = now()`; returns `NotFoundError` if the queue doesn't exist or is already archived.
 - Files: `db.go`, `rules.go`, `config.go`, `items.go`, `mrt.go`, `text_banks.go`, `auth.go`, `signing_keys.go`, `executions.go`, `orgs.go`, `users.go`, `counters.go`, `history.go`
 - Estimated size: ~1,100 lines
 
@@ -978,6 +983,10 @@ func NewActionPublisher(store *store.Queries, signer Signer, httpClient *http.Cl
 // individual failures returned as ActionResult with Success=false.
 func (p *ActionPublisher) PublishActions(ctx context.Context, actions []domain.ActionRequest, target ActionTarget) []domain.ActionResult
 
+// ActionCache returns the pool's action cache for external invalidation.
+// Used by the composition root to wire CacheInvalidator for MRTService.
+func (p *Pool) ActionCache() *Cache
+
 // --- Cache ---
 
 // Cache is a TTL in-memory cache (sync.RWMutex + map).
@@ -986,6 +995,8 @@ type Cache struct { /* ... */ }
 func NewCache(ttl time.Duration) *Cache
 func (c *Cache) Get(key string) (any, bool)
 func (c *Cache) Set(key string, value any)
+func (c *Cache) Delete(key string)
+func (c *Cache) Purge()
 ```
 
 ### Upstream Dependencies
@@ -1213,12 +1224,33 @@ func (s *ConfigService) GetItemType(ctx context.Context, orgID, itemTypeID strin
 func (s *ConfigService) ListItemTypes(ctx context.Context, orgID string, page domain.PageParams) (*domain.PaginatedResult[domain.ItemType], error)
 
 // --- MRTService ---
-type MRTService struct {
-    store  *store.Queries
-    logger *slog.Logger
+
+// CacheInvalidator allows MRTService to invalidate cached queue IDs in the
+// engine's action cache without importing the engine package.
+type CacheInvalidator interface {
+    InvalidateMRTQueue(orgID, queueName string)
 }
 
-func NewMRTService(store *store.Queries, logger *slog.Logger) *MRTService
+// CacheInvalidatorFunc is a function adapter for CacheInvalidator.
+type CacheInvalidatorFunc func(orgID, queueName string)
+func (f CacheInvalidatorFunc) InvalidateMRTQueue(orgID, queueName string)
+
+// CreateQueueParams holds inputs for creating a new MRT queue.
+type CreateQueueParams struct {
+    Name        string
+    Description string
+    IsDefault   bool
+}
+
+type MRTService struct {
+    store    *store.Queries
+    logger   *slog.Logger
+    cacheInv CacheInvalidator
+}
+
+// NewMRTService creates an MRTService. cacheInv may be nil (cache invalidation
+// is skipped, suitable for tests).
+func NewMRTService(store *store.Queries, logger *slog.Logger, cacheInv CacheInvalidator) *MRTService
 
 // Enqueue creates a new MRT job in the specified queue.
 func (s *MRTService) Enqueue(ctx context.Context, params EnqueueParams) (string, error)
@@ -1230,7 +1262,7 @@ func (s *MRTService) AssignNext(ctx context.Context, orgID, queueID, userID stri
 // Does NOT execute actions itself -- avoids circular dependency with ActionPublisher.
 func (s *MRTService) RecordDecision(ctx context.Context, params DecisionParams) (*DecisionResult, error)
 
-// ListQueues returns all MRT queues for the org.
+// ListQueues returns all MRT queues for the org (excludes archived).
 func (s *MRTService) ListQueues(ctx context.Context, orgID string) ([]domain.MRTQueue, error)
 
 // ListJobs returns paginated jobs for a queue.
@@ -1238,6 +1270,16 @@ func (s *MRTService) ListJobs(ctx context.Context, orgID, queueID string, status
 
 // GetJob returns a single MRT job.
 func (s *MRTService) GetJob(ctx context.Context, orgID, jobID string) (*domain.MRTJob, error)
+
+// CreateQueue validates name, generates UUID, persists a new MRT queue.
+// Raises: *domain.ValidationError if name is empty.
+// Raises: *domain.ConflictError if (org_id, name) already exists among active queues.
+func (s *MRTService) CreateQueue(ctx context.Context, orgID string, params CreateQueueParams) (*domain.MRTQueue, error)
+
+// ArchiveQueue soft-deletes an MRT queue and invalidates the UDF cache entry.
+// Steps: fetch queue by ID (learn name), archive in DB, invalidate action cache.
+// Raises: *domain.NotFoundError if queue does not exist or is already archived.
+func (s *MRTService) ArchiveQueue(ctx context.Context, orgID, queueID string) error
 
 // --- ItemService ---
 type ItemService struct {
@@ -1469,6 +1511,8 @@ func NewRouter(
 //   GET/POST        /api/v1/item-types
 //   GET/PUT/DELETE  /api/v1/item-types/{id}
 //   GET             /api/v1/mrt/queues
+//   POST            /api/v1/mrt/queues           (ADMIN only)
+//   DELETE          /api/v1/mrt/queues/{id}      (ADMIN only, returns 204)
 //   GET             /api/v1/mrt/queues/{id}/jobs
 //   POST            /api/v1/mrt/queues/{id}/assign
 //   POST            /api/v1/mrt/decisions
@@ -1526,6 +1570,7 @@ func PageParamsFromRequest(r *http.Request) domain.PageParams
 ### Key Implementation Notes
 - Handlers are thin: parse request, call service, write response. No business logic.
 - MRT decision handler orchestrates the flow: calls MRTService.RecordDecision, then ActionPublisher.PublishActions with the returned ActionRequests.
+- `handleCreateQueue` (POST /api/v1/mrt/queues) returns 201 Created. `handleArchiveQueue` (DELETE /api/v1/mrt/queues/{id}) returns 204 No Content. Both require ADMIN role via `r.With(auth.RequireRole(domain.UserRoleAdmin))`.
 - Auth handler manages login (create session), logout (delete session), and me (return current user). The login handler calls the auth module (not store directly) for password verification and session creation.
 - UDF listing handler returns a hardcoded list of UDF definitions (name, signature, description, example).
 - Auth middleware closures (sessionAuthMw, apiKeyAuthMw) are constructed in cmd/server and passed as parameters, so handler never imports store.
@@ -1644,7 +1689,7 @@ func main()
 - None. Run manually during development setup.
 
 ### Key Implementation Notes
-- MRT queue creation happens here. Queues are infrastructure created during org provisioning, not through the REST API in v1.0. The store.CreateMRTQueue method is called directly.
+- MRT queue creation happens here for seed data. Queues can also be created and archived via the REST API (POST/DELETE /api/v1/mrt/queues, ADMIN only).
 - Idempotent: can be run multiple times without creating duplicates (uses INSERT ... ON CONFLICT DO NOTHING).
 - File: `cmd/seed/main.go`
 - Estimated size: ~120 lines

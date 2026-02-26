@@ -574,8 +574,13 @@ CREATE TABLE mrt_queues (
   is_default  BOOLEAN NOT NULL DEFAULT false,
   created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-  UNIQUE (org_id, name)
+  archived_at TIMESTAMPTZ              -- soft-delete: set on archive, NULL = active
 );
+-- Partial unique index: name uniqueness applies only to active (non-archived) queues.
+-- This allows re-creating a queue with the same name after archiving the old one.
+CREATE UNIQUE INDEX mrt_queues_org_id_name_active_key
+  ON mrt_queues (org_id, name)
+  WHERE archived_at IS NULL;
 
 CREATE TABLE mrt_jobs (
   id              TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
@@ -1274,16 +1279,29 @@ func (p *ActionPublisher) PublishActions(
 
 Same as coop-lite-go. `RecordDecision` returns `ActionRequest[]` for the handler to orchestrate. No circular dependency.
 
+**Queue lifecycle**: Queues use soft-delete via `archived_at` column (same pattern as API key revocation via `revoked_at`). Archived queues are excluded from `ListQueues` and name-based lookups but remain accessible by ID so that in-flight MRT jobs can drain. Create and archive operations require ADMIN role, enforced by `RequireRole` middleware at the router level.
+
+**Cache invalidation**: Archiving a queue invalidates the engine's action cache entry for that queue via the `CacheInvalidator` interface. This prevents the `enqueue()` UDF from resolving a stale queue ID after archive. The `CacheInvalidator` is injected into `MRTService` at the composition root as a function adapter (`CacheInvalidatorFunc`) to avoid a direct import of the `engine` package.
+
 ```go
 // internal/service/mrt.go
 
-type MRTService struct {
-    store  *store.Queries
-    logger *slog.Logger
+// CacheInvalidator allows MRTService to invalidate cached queue IDs in the
+// engine's action cache without importing the engine package.
+type CacheInvalidator interface {
+    InvalidateMRTQueue(orgID, queueName string)
 }
 
+type MRTService struct {
+    store    *store.Queries
+    logger   *slog.Logger
+    cacheInv CacheInvalidator  // nil-safe; injected at composition root
+}
+
+func (s *MRTService) CreateQueue(ctx context.Context, orgID string, params CreateQueueParams) (*domain.MRTQueue, error)
+func (s *MRTService) ArchiveQueue(ctx context.Context, orgID, queueID string) error
 func (s *MRTService) Enqueue(ctx context.Context, params EnqueueParams) (string, error)
-func (s *MRTService) AssignNext(ctx context.Context, queueID, userID string) (*domain.MRTJob, error)
+func (s *MRTService) AssignNext(ctx context.Context, orgID, queueID, userID string) (*domain.MRTJob, error)
 func (s *MRTService) RecordDecision(ctx context.Context, params DecisionParams) (*DecisionResult, error)
 ```
 
@@ -1334,6 +1352,8 @@ DELETE /api/v1/item-types/{id}
 
 # MRT
 GET    /api/v1/mrt/queues
+POST   /api/v1/mrt/queues              # Create queue (ADMIN only)
+DELETE /api/v1/mrt/queues/{id}         # Archive queue (ADMIN only, soft-delete)
 GET    /api/v1/mrt/queues/{id}/jobs
 POST   /api/v1/mrt/queues/{id}/assign
 POST   /api/v1/mrt/decisions
@@ -1462,7 +1482,7 @@ Same constraint as fruitfly: **zero `sync.Mutex` in the evaluation hot path.**
 | `sync.Map` | Signal cache per evaluation context | Per-event signal result caching |
 
 `sync.RWMutex` is used only in:
-- `engine.Cache` (not in the evaluation hot path -- used for action name resolution cache)
+- `engine.Cache` (not in the evaluation hot path -- used for action name and MRT queue resolution cache; entries invalidated on queue archive via `CacheInvalidator`)
 - `signal.Registry` (read-only after startup)
 
 ### Goroutine Budget

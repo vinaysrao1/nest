@@ -134,6 +134,131 @@ Run a single test:
 go test ./internal/engine/... -run TestCompiler -v
 ```
 
+## Jetstream Test (Bluesky Firehose Integration)
+
+The Jetstream test connects to the live [Bluesky AT Protocol firehose](https://docs.bsky.app/docs/advanced-guides/firehose) via WebSocket, consumes real posts and likes, submits them to a local Nest instance for rule evaluation, and validates the results. This is an end-to-end integration test using real-world data.
+
+### Prerequisites
+
+- **Docker** (for PostgreSQL via docker-compose)
+- **Go 1.25+** (to build all binaries)
+- **Internet access** (the consumer connects to `wss://jetstream2.us-east.bsky.network/subscribe`)
+- **Ports 8080 and 9090 must be free** (Nest API and webhook receiver respectively)
+
+### Running the Test
+
+There are two modes:
+
+#### Count-limited mode (`run.sh`)
+
+Consumes a fixed number of items from the firehose, then validates:
+
+```bash
+# Default: 1000 items
+./jetstream/run.sh
+
+# Custom count: 500 items
+./jetstream/run.sh 500
+```
+
+This script runs through 8 steps:
+1. Starts PostgreSQL via docker-compose (port 5433)
+2. Builds all binaries (nest server, migrate, seed, setup, consumer, receiver, validate)
+3. Runs migrations, seeds default data, and cleans test tables
+4. Starts a webhook receiver on port 9090
+5. Starts the Nest server on port 8080
+6. Runs test setup (creates item types, rules, actions, API key)
+7. Runs the Jetstream consumer until the item count is reached
+8. Waits for the pipeline to drain, then runs validation
+
+#### Time-limited mode (`run_timed.sh`)
+
+Consumes from the firehose for a fixed duration, then validates:
+
+```bash
+# Default: 2 minutes
+./jetstream/run_timed.sh
+
+# Custom duration: 5 minutes
+./jetstream/run_timed.sh 5
+```
+
+Same setup steps as `run.sh`, but the consumer runs continuously in the background for the specified number of minutes. Progress is printed every 30 seconds. After the timer expires, the consumer is stopped and validation runs.
+
+### What Gets Set Up
+
+The test scripts automatically create the following via the seed and setup tools:
+
+| Entity | Details |
+|--------|---------|
+| **Org** | `Default Org` (ID: `org-default`) |
+| **Admin User** | Email: `admin@nest.local`, Password: `admin123`, Role: ADMIN |
+| **MRT Queues** | `default`, `urgent`, `escalation` |
+| **Item Types** | `post` (text + entity_id), `like` (entity_id + subject_uri) |
+| **Actions** | `webhook-notify` (WEBHOOK to :9090), `mrt-review` (ENQUEUE_TO_MRT to default queue) |
+| **Rules** | Loaded from `loadtest/rules/*.star` (catchall, spam detection, content filters, etc.) |
+| **API Key** | `nest-test-key` (auto-generated, saved to `/tmp/nest_test_api_key.txt`) |
+
+### Seeded Credentials
+
+To log in to the Nest API or UI during a test run:
+
+| Field | Value |
+|-------|-------|
+| Email | `admin@nest.local` |
+| Password | `admin123` |
+
+**WARNING:** These credentials are for development and testing only. Do not use them in production.
+
+### Accessing Nest During a Test Run
+
+While a test is running (especially useful with `run_timed.sh` for longer durations):
+
+- **Nest API:** `http://localhost:8080` (e.g., `http://localhost:8080/api/v1/health`)
+- **Login:** `POST http://localhost:8080/api/v1/auth/login` with `{"email": "admin@nest.local", "password": "admin123"}`
+
+You can create additional rules, inspect items, review MRT queues, and observe verdicts in real time against live Bluesky data.
+
+### OpenAI Moderation (Optional)
+
+If you set `OPENAI_API_KEY` before running the test, the setup will load additional rules from `loadtest/rules/optional/` that use the OpenAI moderation signal adapter. An `openai` MRT queue is also created for flagged content review.
+
+```bash
+export OPENAI_API_KEY="sk-..."
+./jetstream/run_timed.sh 5
+```
+
+### Docker Demo (All-in-One)
+
+For a fully self-contained demo with PostgreSQL, Nest, Jetstream consumer, and the NiceGUI admin UI in a single container:
+
+```bash
+docker build -f Dockerfile.demo -t nest-demo .
+docker run -p 8080:8080 -p 8090:8090 nest-demo
+```
+
+After startup completes:
+
+- **Nest API:** `http://localhost:8080`
+- **Admin UI:** `http://localhost:8090`
+- **Login:** `admin@nest.local` / `admin123`
+
+The demo container automatically runs migrations, seeds data, starts the Nest server, begins consuming from the Bluesky firehose, and launches the admin UI.
+
+### Cleanup
+
+The test scripts clean up automatically on exit (processes are killed, temp binaries removed). To stop the PostgreSQL container started by docker-compose:
+
+```bash
+docker compose -f loadtest/docker-compose.yml down
+```
+
+To also remove the persisted data volume:
+
+```bash
+docker compose -f loadtest/docker-compose.yml down -v
+```
+
 ## Architecture
 
 Nine Go packages under `internal/`:

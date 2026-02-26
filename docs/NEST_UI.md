@@ -403,6 +403,15 @@ class NestClient:
         """GET /api/v1/mrt/queues"""
         ...
 
+    async def create_mrt_queue(self, name: str, description: str = "",
+                               is_default: bool = False) -> MRTQueue:
+        """POST /api/v1/mrt/queues"""
+        ...
+
+    async def archive_mrt_queue(self, queue_id: str) -> None:
+        """DELETE /api/v1/mrt/queues/{id} (soft-delete)"""
+        ...
+
     async def list_mrt_jobs(self, queue_id: str, status: str | None = None,
                             page: int = 1) -> PaginatedResult[MRTJob]:
         """GET /api/v1/mrt/queues/{id}/jobs"""
@@ -645,9 +654,13 @@ This page is ~200-250 lines of Python. The Starlark editor is the key differenti
 Two sub-views:
 
 **Queue list** (`/mrt`):
-- Table of queues with columns: Name, Pending Count, Assigned Count, Decided Count
-- Queues are read-only in the UI. Queue creation and configuration is a CLI/seed-only operation (via `cmd/seed/main.go`). Queues are infrastructure -- they are created during org setup and rarely change. Adding a full queue CRUD UI is not justified for v1.0.
-- Click queue -> shows jobs
+- Table of queues with columns: Name, Description, Default
+- ADMIN users see a "Create Queue" button in the header and an "Archive" button on each queue row
+- Create dialog has Name (required), Description (textarea), and Is Default (checkbox) fields
+- Archive uses a confirmation dialog explaining soft-delete semantics ("No new jobs will be enqueued. Pending jobs can still be assigned.")
+- Non-admin users see a read-only table with row-click navigation
+- No PUT (update) endpoint exists yet -- queue editing is not supported in v1.0
+- Click queue name -> shows jobs
 
 **Job review** (`/mrt/queues/{id}` and `/mrt/jobs/{id}`):
 - "Get Next Job" button -> calls `POST /api/v1/mrt/queues/{id}/assign`
@@ -946,7 +959,7 @@ def is_moderator_or_above() -> bool:
 | Action management | `actions.py` | `/actions/*` |
 | Policy management | `policies.py` | `/policies/*` |
 | Item type management | `item_types.py` | `/item-types/*` |
-| MRT queues (read-only) + job review + decisions | `mrt.py` | `/mrt/*` |
+| MRT queues (create + archive + list) + job review + decisions | `mrt.py` | `/mrt/*` |
 | Text bank management | `text_banks.py` | `/text-banks/*` |
 | User management (invite-only) | `users.py` | `/users/*` |
 | API key management | `api_keys.py` | `/api-keys/*` |
@@ -973,7 +986,7 @@ def is_moderator_or_above() -> bool:
 | Rule execution history view | `/analytics/rule-executions` | Requires analytics endpoints to query partitioned execution log tables. Partially available via direct SQL in v1.0. |
 | Appeals workflow | Backend appeals service | Not present in Nest v1.0 scope. Requires new domain types (Appeal, AppealDecision) and queue integration. |
 | Org management (multi-org) | Backend org CRUD for super-admins | Nest v1.0 supports multi-tenancy but org creation is a seed/CLI operation. A super-admin UI for managing multiple orgs is deferred. |
-| MRT queue CRUD UI | `POST/PUT/DELETE /api/v1/mrt/queues` | See section 9.7. Queue management is a CLI/seed operation in v1.0. |
+| MRT queue update UI | `PUT /api/v1/mrt/queues/{id}` | Create (`POST`) and archive (`DELETE`) are implemented. Update (rename, change description) requires a PUT endpoint that does not exist yet. |
 
 ---
 
